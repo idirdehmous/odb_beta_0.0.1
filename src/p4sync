@@ -1,0 +1,198 @@
+#!/usr/bin/env python
+
+""" Script to sync sources between Git and P4 repositories.
+
+To use this script you will first need to create a .p4config file in the directory that
+you want to keep in sync with P4.
+
+Here is an example of .p4config file for ODB project:
+
+P4CLIENT=client_datk_CY41R2_odb_develop
+P4PORT=p4rd:14000
+P4PROJECT=odb
+
+"""
+
+import os
+import re
+import sys
+import optparse
+import logging
+import difflib
+import filecmp
+
+from P4 import P4, P4Exception
+
+def gather(source_dir):
+    """ Walk through all sub-directories of source_dir and return a flat list of all files.
+    """
+    source_files = []
+    for path, dirs, files in os.walk(source_dir):
+        for file in files:
+            file = os.path.join(path, file)
+            source_files.append(os.path.relpath(file, source_dir))
+    return source_files
+
+def match(local_files, remote_files, repository):
+    matched_files = []
+    for file in (local_files & remote_files):
+        remote = os.path.join(repository, file)
+        pair = (file, remote)
+        matched_files.append(pair)
+    return matched_files
+
+def copy(source, target):
+    """ Copies content of the source file into the target
+    """
+    with open(source) as s, open(target, "w") as t:
+        t.write(s.read())
+
+def newer(this, that):
+    """ Returns true if this is newer than that
+    """
+    mtime = lambda x: os.path.getmtime(x)
+    if mtime(this) > mtime(that): 
+        with open(this) as a, open(that) as b:
+            if a.read() != b.read():
+                return True
+    return False
+
+def fetch(matched_files):
+    """ Fetch remote changes from P4 client (but do not commit).
+    """
+    count = 0
+    for local, remote in matched_files:
+        if filecmp.cmp(remote, local, shallow=False) or os.path.islink(remote):
+            continue
+        copy(remote, local)
+        sys.stdout.write("fetch: %s => %s\n" % (remote, local))
+        count += 1
+    return count
+
+def diff(matched_files):
+    count = 0
+    for this, that in matched_files:
+        with open(this) as a, open(that) as b:
+            if a.read() != b.read():
+                a.seek(0)
+                b.seek(0)
+                changes = difflib.unified_diff(a.readlines(), b.readlines(),
+                    fromfile=this, tofile=that)
+                sys.stdout.write("".join(changes))
+                count += 1
+    return count
+
+def push(p4, matches):
+    """ Push local changes to P4 client (but do not submit).
+    """
+    count = 0
+    for local, remote in matches:
+        if filecmp.cmp(local, remote, shallow=False) or os.path.islink(local):
+            continue
+        p4.run("edit", os.path.relpath(remote, p4.cwd))
+        copy(local, remote)
+        sys.stdout.write("push: %s => %s\n" % (local, remote))
+        count += 1
+    return count
+
+def p4_config():
+    """ Return path to .p4config file if found, otherwise returns None.
+    """
+    head = tail = os.path.abspath(".")
+    while tail:
+        file = os.path.join(head, ".p4config")
+        if os.path.exists(file):
+            return file
+        head, tail = os.path.split(head)
+    return None
+
+def main():
+
+    parser = optparse.OptionParser()
+    parser.usage = "%prog fetch|push|ls-files|diff"
+    parser.add_option("-c", "--client", help="use specific P4 client", metavar="P4CLIENT")
+    parser.add_option("-v", "--verbose", action="store_true", default=False, help="be verbose")
+    opts, args = parser.parse_args()
+
+    if len(args) < 1:
+        parser.error("Invalid number of arguments\n\n")
+
+    command = args.pop(0)
+
+    if not command in ("fetch", "push", "ls-files", "diff"):
+        parser.error("Invalid command: %s\n" % command)
+
+    level = logging.WARNING
+    if opts.verbose:
+        level = logging.INFO
+    logging.basicConfig(level=level, format="%(message)s")
+
+    config = p4_config()
+
+    if config is None:
+        sys.stderr.write("Could not find .p4config file.\n")
+        sys.stderr.write("You will need to create this file in a directory that you want to sync with P4.\n")
+        sys.exit(1)
+
+    p4 = P4()
+    p4.user = os.getenv("USER")
+    p4_project = None
+
+    with open(config) as file:
+        logging.info("Reading P4 config file: %s" % config)
+        for line in file:
+            key, value = line.strip().split("=")
+            if key == "P4CLIENT":
+                p4.client = value
+            elif key == "P4PORT":
+                p4.port = value
+            elif key == "P4PROJECT":
+                p4_project = value
+
+    # Override the P4 client if required
+    if opts.client:
+        p4.client = opts.client
+
+    logging.info("Connecting to P4 client %s at port %s" % (p4.client, p4.port))
+    p4.connect()
+    info = p4.run("info")
+    p4.cwd = info[0]["clientRoot"]
+    logging.info("P4 client root: %s" % p4.cwd)
+
+    p4_project_dir = os.path.join(p4.cwd, p4_project)
+    if not os.path.exists(p4_project_dir):
+        sys.stderr.write("Please add %s project to your P4 branch %s\n" % (p4_project, p4.client))
+        sys.exit(1)
+
+    # Generate a list of all local Git files and remote P4 files and match them up.
+
+    local_dir, _ = os.path.split(config)
+    local_files = set(gather(local_dir))
+    remote_files = set(gather(p4_project_dir))
+    matched_files = match(local_files, remote_files, p4_project_dir)
+
+    if command == "ls-files":
+        for pair in matched_files:
+            sys.stdout.write(" %s <=> %s\n" % pair)
+
+    elif command == "diff":
+        if len(args) != 0:
+            matched_files = filter(lambda x: x[0] in args, matched_files)
+        if diff(matched_files) == 0:
+            sys.stdout.write("No differencies, all files up to date.\n")
+
+    elif command == "fetch":
+        if len(args) != 0:
+            function = lambda x: os.path.basename(x[1]) in args
+            matched_files = filter(function, matched_files)
+        if fetch(matched_files) == 0:
+            sys.stdout.write("Nothing to fetch, all files up to date.\n")
+
+    elif command == "push":
+        if len(args) != 0:
+            matched_files = filter(lambda x: x[0] in args, matched_files)
+        if push(p4, matched_files) == 0:
+            sys.stdout.write("Nothing to push, all files up to date.\n")
+
+if __name__ == "__main__": main()
+
